@@ -47,6 +47,18 @@ Time       Level    Rate           ETA empty
 14:12:11    86%     -5.83 %/h      14h 45m
 ```
 
+## Device-type detection
+
+`scan` lists each device's type, and `monitor` prints it on connect. Detection
+uses, in priority order:
+
+1. The BLE **Appearance** characteristic (0x2A01) — the standard way devices
+   declare themselves (Headphones, Earbud, Speaker, Smartwatch, Keyboard…).
+2. Advertised GATT service UUIDs (e.g. HID 0x1812, Heart Rate 0x180D).
+3. Name keywords (e.g. "buds" → Earbuds).
+
+The detected type is also logged in the CSV's `device_type` column.
+
 ## How the rate is computed
 
 A least-squares linear fit over all samples in the session (battery % vs
@@ -67,8 +79,8 @@ improves with longer sessions.
 ## CSV format
 
 ```csv
-timestamp_utc,battery_pct
-2026-09-29T08:32:11+00:00,87
+timestamp_utc,device_type,battery_pct
+2026-09-29T08:32:11+00:00,Headphones,87
 ```
 
 ## License

@@ -5,6 +5,9 @@ bluetooth-battery-discharge-detector
 Poll a Bluetooth LE device's standard Battery Service (0x180F) and compute
 its discharge rate (%/hour) plus an estimated time-to-empty.
 
+Also detects the device type via the BLE Appearance characteristic (0x2A01),
+falling back to advertised service UUIDs and name heuristics.
+
 Usage:
     python bt_battery_drain.py scan
     python bt_battery_drain.py monitor AA:BB:CC:DD:EE:FF [--interval 60] [--duration 3600] [--out log.csv]
@@ -26,18 +29,188 @@ except ImportError:
     sys.exit(1)
 
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34f0"
+APPEARANCE_UUID = "00002a01-0000-1000-8000-00805f9b34f0"
+DEVICE_NAME_UUID = "00002a00-0000-1000-8000-00805f9b34f0"
 
+# ---------------------------------------------------------------------------
+# Device-type detection
+# ---------------------------------------------------------------------------
+# Bluetooth SIG Appearance categories (64-value blocks) and notable sub-types.
+APPEARANCE_CATEGORIES = {
+    0x0040: "Phone",
+    0x0080: "Computer",
+    0x00C0: "Watch",
+    0x0100: "Clock",
+    0x0140: "Display",
+    0x0180: "Remote Control",
+    0x01C0: "Eye-glasses",
+    0x0200: "Tag",
+    0x0240: "Keyring",
+    0x0280: "Media Player",
+    0x02C0: "Barcode Scanner",
+    0x0300: "Thermometer",
+    0x0340: "Heart Rate Sensor",
+    0x0380: "Blood Pressure Monitor",
+    0x03C0: "HID Device",
+    0x0400: "Glucose Meter",
+    0x0440: "Running/Walking Sensor",
+    0x0480: "Cycling Device",
+    0x04C0: "Control Device",
+    0x0500: "Network Device",
+    0x0540: "Sensor",
+    0x0580: "Light Fixture",
+    0x05C0: "Fan",
+    0x0600: "HVAC",
+    0x0640: "Air Conditioning",
+    0x0680: "Humidifier",
+    0x06C0: "Heating",
+    0x0700: "Access Control",
+    0x0740: "Motorized Device",
+    0x0780: "Power Device",
+    0x07C0: "Light Source",
+    0x0800: "Window Covering",
+    0x0840: "Audio Sink",
+    0x0880: "Audio Source",
+    0x08C0: "Motorized Vehicle",
+    0x0900: "Domestic Appliance",
+    0x0940: "Wearable Audio Device",
+    0x0980: "Aircraft",
+    0x09C0: "AV Equipment",
+    0x0A00: "Display Equipment",
+    0x0A40: "Hearing Aid",
+    0x0A80: "Gaming Device",
+    0x0AC0: "Signage",
+}
+
+APPEARANCE_SUBTYPES = {
+    0x00C1: "Sports Watch",
+    0x00C2: "Smartwatch",
+    0x03C1: "Keyboard",
+    0x03C2: "Mouse",
+    0x03C3: "Joystick",
+    0x03C4: "Gamepad",
+    0x03C5: "Digitizer Tablet",
+    0x03C6: "Card Reader",
+    0x03C7: "Digital Pen",
+    0x03C8: "Barcode Scanner",
+    0x03C9: "Touchpad",
+    0x03CA: "Presentation Remote",
+    0x0841: "Standalone Speaker",
+    0x0842: "Soundbar",
+    0x0843: "Bookshelf Speaker",
+    0x0844: "Standmounted Speaker",
+    0x0845: "Speakerphone",
+    0x0881: "Microphone",
+    0x0882: "Alarm",
+    0x0885: "Broadcasting Device",
+    0x0941: "Earbud",
+    0x0942: "Headset",
+    0x0943: "Headphones",
+    0x0944: "Neck Band",
+    0x0A41: "In-Ear Hearing Aid",
+    0x0A42: "Behind-Ear Hearing Aid",
+    0x0A43: "Cochlear Implant",
+}
+
+# Advertised GATT service -> device hint (16-bit UUIDs).
+SERVICE_HINTS = {
+    0x1812: "HID Device",
+    0x180D: "Heart Rate Monitor",
+    0x1810: "Blood Pressure Monitor",
+    0x1808: "Glucose Meter",
+    0x1814: "Running/Walking Sensor",
+    0x1816: "Cycling Sensor",
+    0x1818: "Cycling Power Meter",
+    0x181A: "Environmental Sensor",
+    0x1822: "Pulse Oximeter",
+    0x1826: "Fitness Machine",
+}
+
+# Name keyword -> device hint (checked in order; specific first).
+NAME_HINTS = [
+    ("airpod", "Earbuds"),
+    ("bud", "Earbuds"),
+    ("headphone", "Headphones"),
+    ("headset", "Headset"),
+    ("soundbar", "Soundbar"),
+    ("speaker", "Speaker"),
+    ("keyboard", "Keyboard"),
+    ("mouse", "Mouse"),
+    ("smartwatch", "Smartwatch"),
+    ("watch", "Watch"),
+    ("fitness", "Fitness Band"),
+    ("band", "Fitness Band"),
+    ("tablet", "Tablet"),
+    ("laptop", "Computer"),
+    ("phone", "Phone"),
+    ("tv", "TV"),
+]
+
+
+def _uuid16(uuid_str):
+    """Extract the 16-bit short UUID from a 128-bit UUID string."""
+    try:
+        return int(str(uuid_str).split("-")[0], 16) & 0xFFFF
+    except (ValueError, AttributeError, IndexError):
+        return None
+
+
+def appearance_name(value):
+    """Human-readable label for a BLE Appearance value."""
+    if value in APPEARANCE_SUBTYPES:
+        return APPEARANCE_SUBTYPES[value]
+    if value in APPEARANCE_CATEGORIES:
+        return APPEARANCE_CATEGORIES[value]
+    category = value & 0xFFC0
+    if category in APPEARANCE_CATEGORIES:
+        return f"{APPEARANCE_CATEGORIES[category]} (0x{value:04X})"
+    if value == 0:
+        return "Unknown"
+    return f"Unknown (0x{value:04X})"
+
+
+def classify_device(name=None, service_uuids=(), appearance=None):
+    """Best-effort device-type label.
+
+    Priority: Appearance characteristic > advertised services > name keywords.
+    """
+    if appearance is not None:
+        label = appearance_name(appearance)
+        if not label.startswith("Unknown"):
+            return label
+    for su in service_uuids or ():
+        short = _uuid16(su)
+        if short in SERVICE_HINTS:
+            return SERVICE_HINTS[short]
+    lname = (name or "").lower()
+    for keyword, label in NAME_HINTS:
+        if keyword in lname:
+            return label
+    if appearance is not None:
+        return appearance_name(appearance)
+    return "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 async def cmd_scan(args):
     print("Scanning for BLE devices (10s)...")
-    devices = await BleakScanner.discover(timeout=10.0)
-    if not devices:
+    found = await BleakScanner.discover(timeout=10.0, return_adv=True)
+    items = found.values() if isinstance(found, dict) else found
+    items = list(items)
+    if not items:
         print("No devices found.")
         return
-    print(f"{'Address':<20} {'Name'}")
-    print("-" * 50)
-    for d in sorted(devices, key=lambda x: (x.name or "zzz")):
-        print(f"{d.address:<20} {d.name or '(unknown)'}")
+    print(f"{'Address':<20} {'Type':<20} {'Name'}")
+    print("-" * 62)
+    rows = []
+    for dev, adv in items:
+        dtype = classify_device(dev.name, getattr(adv, "service_uuids", None))
+        rows.append((dev.address, dtype, dev.name or "(unknown)"))
+    for address, dtype, name in sorted(rows, key=lambda r: r[2].lower()):
+        print(f"{address:<20} {dtype:<20} {name}")
 
 
 def discharge_rate(samples):
@@ -66,6 +239,22 @@ def fmt_eta(hours):
     return f"{h}h {m:02d}m"
 
 
+async def _read_device_info(client):
+    """Read device name + appearance; return a type label."""
+    name, appearance = None, None
+    try:
+        raw = await client.read_gatt_char(DEVICE_NAME_UUID)
+        name = bytes(raw).decode("utf-8", "ignore").strip() or None
+    except Exception:
+        pass
+    try:
+        raw = await client.read_gatt_char(APPEARANCE_UUID)
+        appearance = int.from_bytes(bytes(raw)[:2], "little")
+    except Exception:
+        pass
+    return classify_device(name=name, appearance=appearance)
+
+
 async def cmd_monitor(args):
     address = args.address
     interval = max(5, args.interval)
@@ -75,14 +264,17 @@ async def cmd_monitor(args):
     samples = []
     csv_file = open(out_path, "w", newline="")
     writer = csv.writer(csv_file)
-    writer.writerow(["timestamp_utc", "battery_pct"])
+    writer.writerow(["timestamp_utc", "device_type", "battery_pct"])
 
     print(f"Connecting to {address} ...  (Ctrl+C to stop)")
+    device_type = "Unknown"
     try:
         async with BleakClient(address, timeout=20.0) as client:
             if not client.is_connected:
                 print("Could not connect. Make sure the device is on, nearby and paired.")
                 return
+            device_type = await _read_device_info(client)
+            print(f"Device type: {device_type}")
             try:
                 raw = await client.read_gatt_char(BATTERY_LEVEL_UUID)
             except Exception as exc:
@@ -103,7 +295,8 @@ async def cmd_monitor(args):
                     continue
                 now = time.time()
                 samples.append((now, level))
-                writer.writerow([datetime.fromtimestamp(now, timezone.utc).isoformat(), level])
+                writer.writerow([datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                                 device_type, level])
                 csv_file.flush()
 
                 rate = discharge_rate(samples)
@@ -124,7 +317,8 @@ async def cmd_monitor(args):
     if len(samples) >= 2:
         rate = discharge_rate(samples)
         span_h = (samples[-1][0] - samples[0][0]) / 3600
-        print(f"\nSession: {len(samples)} samples over {span_h:.2f}h "
+        print(f"\nDevice: {device_type} ({address})")
+        print(f"Session: {len(samples)} samples over {span_h:.2f}h "
               f"({samples[0][1]}% -> {samples[-1][1]}%)")
         if rate is not None:
             print(f"Discharge rate: {rate:+.2f} %/hour")
@@ -138,7 +332,7 @@ def main():
     p = argparse.ArgumentParser(description="Bluetooth battery discharge rate detector")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("scan", help="Discover nearby BLE devices")
+    s = sub.add_parser("scan", help="Discover nearby BLE devices (with type detection)")
     s.set_defaults(func=cmd_scan)
 
     m = sub.add_parser("monitor", help="Monitor a device's battery level")
