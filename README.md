@@ -4,9 +4,16 @@ A small portable tool that polls a Bluetooth LE device's standard **Battery
 Service (0x180F)** and computes its **discharge rate (%/hour)** plus an
 estimated time-to-empty. Logs every reading to CSV for later analysis.
 
+## Portable Windows app
+
+No Python needed: a standalone `bt-battery-drain.exe` is built automatically
+by the **Build portable app** workflow (Actions tab → run it manually, then
+download the `bt-battery-drain-windows` artifact). Tagged versions (e.g.
+`v0.1`) also attach the exe to the GitHub release.
+
 ## Requirements
 
-- Python 3.9+
+- Python 3.9+ (only if running from source)
 - Windows 10+ / Linux / macOS with a Bluetooth LE adapter
 - `pip install bleak`
 
